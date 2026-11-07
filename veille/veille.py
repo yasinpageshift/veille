@@ -187,7 +187,9 @@ def vue(nom):
            f"📍 Villes : {lieux}\n📏 Zone : {zone}\n{etat}\n"
            f"🌐 Sites perso : {len(s['sites'])}\n"
            f"🕒 Dernier passage : {heure(s['dernier_passage'])}\n\n"
-           "Tes choix sont appliqués au prochain passage du bot (5 min maximum).")
+           "👇 Utilise les boutons en bas de l'écran.\n"
+           "⏳ Le bot lit tes boutons toutes les 5 minutes environ : "
+           "après un appui, la réponse peut mettre jusqu'à 5 min.")
     rows = [
         [btn("⏱ Fréquence", "m:freq"), btn("📍 Villes", "m:villes")],
         [btn("📏 Rayon", "m:rayon"),
@@ -196,6 +198,21 @@ def vue(nom):
         [btn("📅 24 h", "rep:1"), btn("📅 3 jours", "rep:3"), btn("📅 7 jours", "rep:7")],
     ]
     return txt, {"inline_keyboard": rows}
+
+
+def en_clavier(markup):
+    """Boutons en bas de l'écran (clavier Telegram) : pas de roue qui tourne."""
+    rows = [[{"text": b["text"]} for b in row] for row in markup["inline_keyboard"]]
+    return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
+
+
+def etiquettes():
+    d = {"⏸ Pause": "a:0", "▶️ Reprendre": "a:1"}
+    for nom in ("main", "freq", "rayon", "villes", "sites"):
+        for row in vue(nom)[1]["inline_keyboard"]:
+            for b in row:
+                d[re.sub(r"^(✅|▫️)\s*", "", b["text"])] = b["callback_data"]
+    return d
 
 
 # ----------------------------------------------------------------------------
@@ -247,6 +264,10 @@ def appliquer_callback(data):
 def appliquer_texte(t):
     global forcer, rapport, vue_courante
     low = t.strip().lower()
+    action = etiquettes().get(re.sub(r"^(✅|▫️)\s*", "", t.strip()))
+    if action:  # tu as appuyé sur un bouton du clavier
+        appliquer_callback(action)
+        return
     vue_courante = "main"
     if low.startswith("/semaine"):
         rapport = max(rapport or 0, 7)
@@ -301,8 +322,7 @@ if interaction:
     for cid in cb_ids:
         tg("answerCallbackQuery", callback_query_id=cid)
     txt, markup = vue(vue_courante)
-    if not (dernier_msg_id and modifier(dernier_msg_id, txt, markup)):
-        envoyer(txt, markup)
+    envoyer(txt, en_clavier(markup))
 
 # ----------------------------------------------------------------------------
 # 2) FAUT-IL CHERCHER MAINTENANT ?
