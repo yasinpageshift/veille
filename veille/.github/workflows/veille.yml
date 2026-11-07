@@ -1,13 +1,20 @@
 name: veille
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: veille
+  cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: veille
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,6 +29,5 @@ jobs:
       - run: |
           git config user.name bot
           git config user.email bot@users.noreply.github.com
-          git add seen.json
-          git commit -m "maj" || true
-          git push
+          git add -A .
+          git diff --cached --quiet || (git commit -m "maj" && git pull --rebase && git push)
