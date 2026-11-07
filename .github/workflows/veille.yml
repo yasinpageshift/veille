@@ -8,6 +8,9 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: veille
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
