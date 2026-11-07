@@ -1,7 +1,7 @@
 import json, os, re, time, math, unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 import requests
 from bs4 import BeautifulSoup
 
@@ -37,8 +37,17 @@ FREQS = [(10, "10 min"), (20, "20 min"), (30, "30 min"), (60, "1 h"), (180, "3 h
          (5760, "4 jours")]
 RAYONS = [(0, "Ville seule"), (5, "5 km"), (10, "10 km"), (20, "20 km"), (30, "30 km (tout)")]
 
+CANTONS = {"Delémont": "JU", "Porrentruy": "JU", "Saignelégier": "JU", "Neuchâtel": "NE",
+           "La Chaux-de-Fonds": "NE", "Fribourg": "FR", "Bulle": "FR", "Genève": "GE",
+           "Nyon": "VD", "Yverdon-les-Bains": "VD", "Vallorbe": "VD"}
+TERMES_JOOBLE = ["operateur-production", "agent-de-production", "controleur-qualite",
+                 "conditionnement", "assemblage", "salle-blanche"]
+# pour les sites perso : il faut un vrai mot de métier dans le lien
+MOTS_METIER = ["opérat", "operat", "agent", "contrôleur", "controleur", "conducteur",
+               "monteur", "emballeur", "conditionneur", "préparateur", "preparateur"]
+
 DEFAUT = {"intervalle_min": 30, "lieux": list(LIEUX_BASE), "rayon_km": 30,
-          "actif": True, "dernier_passage": 0}
+          "actif": True, "dernier_passage": 0, "sites": []}
 
 SETTINGS_FILE, SEEN_FILE, GEO_FILE = "settings.json", "seen.json", "geocache.json"
 
@@ -160,6 +169,14 @@ def vue(nom):
                        for v in liste_villes()], 2)
         rows.append([btn("✅ Toutes", "v:*"), btn("⬅️ Retour", "m:main")])
         return txt, {"inline_keyboard": rows}
+    if nom == "sites":
+        liste = "\n".join(f"{i + 1}. {u}" for i, u in enumerate(s["sites"])) or "(aucun pour l'instant)"
+        txt = ("🌐 Sites ajoutés par toi (pages d'offres d'une entreprise ou d'une agence) :\n"
+               f"{liste}\n\nPour en ajouter un : écris /site suivi du lien de la page "
+               "qui liste les offres.")
+        rows = lignes([btn(f"🗑 Retirer {i + 1}", f"s:{i}") for i in range(len(s["sites"]))], 3)
+        rows.append([btn("⬅️ Retour", "m:main")])
+        return txt, {"inline_keyboard": rows}
     # menu principal
     lieux = ("toutes mes villes" if set(s["lieux"]) == set(LIEUX_BASE)
              else ", ".join(s["lieux"]))
@@ -168,13 +185,14 @@ def vue(nom):
     etat = "🟢 actif" if s["actif"] else "⏸ en pause"
     txt = (f"⚙️ MENU DU BOT\n\n⏱ Fréquence : toutes les {libelle_freq(s['intervalle_min'])}\n"
            f"📍 Villes : {lieux}\n📏 Zone : {zone}\n{etat}\n"
+           f"🌐 Sites perso : {len(s['sites'])}\n"
            f"🕒 Dernier passage : {heure(s['dernier_passage'])}\n\n"
            "Tes choix sont appliqués au prochain passage du bot (5 min maximum).")
     rows = [
         [btn("⏱ Fréquence", "m:freq"), btn("📍 Villes", "m:villes")],
         [btn("📏 Rayon", "m:rayon"),
          btn("▶️ Reprendre" if not s["actif"] else "⏸ Pause", "a:1" if not s["actif"] else "a:0")],
-        [btn("🔎 Chercher maintenant", "go")],
+        [btn("🌐 Mes sites", "m:sites"), btn("🔎 Chercher maintenant", "go")],
         [btn("📅 24 h", "rep:1"), btn("📅 3 jours", "rep:3"), btn("📅 7 jours", "rep:7")],
     ]
     return txt, {"inline_keyboard": rows}
@@ -210,6 +228,11 @@ def appliquer_callback(data):
         else:
             settings["lieux"].append(nom)
         vue_courante = "villes"
+    elif data.startswith("s:"):
+        i = int(data[2:])
+        if 0 <= i < len(settings["sites"]):
+            settings["sites"].pop(i)
+        vue_courante = "sites"
     elif data.startswith("a:"):
         settings["actif"] = data[2:] == "1"
         vue_courante = "main"
@@ -235,6 +258,11 @@ def appliquer_texte(t):
         settings["actif"] = False
     elif low.startswith("/reprendre"):
         settings["actif"] = True
+    elif low.startswith("/site ") or low.startswith("/sites"):
+        url = t.strip().split(None, 1)[1].strip() if " " in t.strip() else ""
+        if url.startswith("http") and url not in settings["sites"]:
+            settings["sites"].append(url)
+        vue_courante = "sites"
     elif low.startswith("/ville "):
         settings["lieux"] = [t.strip()[7:].strip()]
     elif low.startswith("/ajouter "):
@@ -364,53 +392,147 @@ def slug(s):
     return quote(s.lower().replace(" ", "-"))
 
 
-trouvees = {}  # id -> (âge en jours, texte)
-pages_ok = pages_total = 0
+trouvees = {}  # id -> (âge en jours, texte, source)
+stats = {}     # source -> [pages lues, pages total, annonces retenues]
 
-for ville in settings["lieux"]:
-    for terme in TERMES:
-        url = f"https://www.jobscout24.ch/en/jobs-in-{slug(ville)}/{quote(terme)}/"
-        pages_total += 1
-        try:
-            r = S.get(url, timeout=25)
-        except Exception as e:
-            print("Erreur", url, e)
-            continue
-        print(r.status_code, url)
-        time.sleep(1)
-        if r.status_code != 200:
-            continue
-        pages_ok += 1
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.select('a[href*="/job/"]'):
-            m = re.search(r"/job/([0-9a-f\-]{36})", a.get("href", ""))
-            if not m or m.group(1) in trouvees:
+
+def compte(source, ok=0, total=0, annonces=0):
+    st = stats.setdefault(source, [0, 0, 0])
+    st[0] += ok
+    st[1] += total
+    st[2] += annonces
+
+
+def telecharger(url):
+    try:
+        r = S.get(url, timeout=25)
+    except Exception as e:
+        print("Erreur", url, e)
+        return None
+    print(r.status_code, url)
+    time.sleep(1)
+    return BeautifulSoup(r.text, "html.parser") if r.status_code == 200 else None
+
+
+def titre_ok(titre):
+    low = titre.lower()
+    return any(k in low for k in MOTS_OK) and not any(k in low for k in MOTS_KO)
+
+
+# --- Source 1 : JobScout24 (inclut JobCloud et beaucoup d'agences) ----------
+def source_jobscout():
+    for ville in settings["lieux"]:
+        for terme in TERMES:
+            soup = telecharger(
+                f"https://www.jobscout24.ch/en/jobs-in-{slug(ville)}/{quote(terme)}/")
+            compte("JobScout24", total=1, ok=1 if soup else 0)
+            if not soup:
                 continue
-            jid = m.group(1)
-            titre = (a.get("title") or a.get_text(strip=True) or "").strip()
+            for a in soup.select('a[href*="/job/"]'):
+                m = re.search(r"/job/([0-9a-f\-]{36})", a.get("href", ""))
+                if not m or m.group(1) in trouvees:
+                    continue
+                jid = m.group(1)
+                titre = (a.get("title") or a.get_text(strip=True) or "").strip()
+                if not titre_ok(titre):
+                    continue
+                li = a.find_parent("li")
+                infos = [i for i in (li.stripped_strings if li else []) if i != titre]
+                ok, d = passe_zone(ville, lieu_annonce(infos))
+                if not ok:
+                    continue
+                age = age_en_jours(infos[-1]) if infos else 0
+                ligne2 = " | ".join(infos)
+                if d is not None:
+                    ligne2 += f"\n📏 {d:.0f} km de {ville}"
+                lien = f"https://www.jobscout24.ch/en/job/{jid}/"
+                trouvees[jid] = (age, f"🆕 {titre}\n{ligne2}\n{lien}", "JobScout24")
+                compte("JobScout24", annonces=1)
+
+
+# --- Source 2 : Jooble (agrège aussi Adecco, Manpower, Flexsis, etc.) --------
+def age_jooble(t):
+    m = re.search(r"il y a (un|une|\d+)\s*(minute|heure|jour|semaine|mois)", t.lower())
+    if not m:
+        return 0
+    n = 1 if m.group(1) in ("un", "une") else int(m.group(1))
+    return n * {"minute": 0, "heure": 0, "jour": 1, "semaine": 7, "mois": 30}[m.group(2)]
+
+
+def source_jooble():
+    for ville in settings["lieux"]:
+        canton = CANTONS.get(ville)
+        if not canton:
+            continue  # Jooble : seulement les villes de la liste de base
+        for terme in TERMES_JOOBLE:
+            soup = telecharger(
+                f"https://ch.jooble.org/emploi-{terme}/{quote(slug_j(ville))}-{canton}")
+            compte("Jooble", total=1, ok=1 if soup else 0)
+            if not soup:
+                continue
+            for a in soup.select('a[href*="/jdp/"], a[href*="/rjdp/"]'):
+                m = re.search(r"/r?jdp/(-?\d+)", a.get("href", ""))
+                if not m:
+                    continue
+                jid = "jooble" + m.group(1)
+                titre = a.get_text(" ", strip=True)
+                if jid in trouvees or not titre_ok(titre):
+                    continue
+                li = a.find_parent("li")
+                infos = [i for i in (li.stripped_strings if li else []) if i != titre]
+                if len(infos) < 2:
+                    continue
+                age_txt, lieu_txt = infos[-1], infos[-2]
+                lieu = re.sub(r"\s+[A-Z]{2}$", "", lieu_txt)
+                ok, d = passe_zone(ville, lieu)
+                if not ok:
+                    continue
+                ligne2 = f"{lieu_txt} | {age_txt}"
+                if d is not None:
+                    ligne2 += f"\n📏 {d:.0f} km de {ville}"
+                lien = a["href"] if a["href"].startswith("http") else "https://ch.jooble.org" + a["href"]
+                trouvees[jid] = (age_jooble(age_txt), f"🆕 {titre}\n{ligne2}\n{lien}", "Jooble")
+                compte("Jooble", annonces=1)
+
+
+def slug_j(s):
+    return s.replace(" ", "-")
+
+
+# --- Source 3 : tes propres sites (entreprises, agences) ---------------------
+def source_sites():
+    for url in settings["sites"]:
+        nom = re.sub(r"^https?://(www\.)?", "", url).split("/")[0]
+        soup = telecharger(url)
+        compte(nom, total=1, ok=1 if soup else 0)
+        if not soup:
+            continue
+        for a in soup.find_all("a", href=True):
+            titre = a.get_text(" ", strip=True) or a.get("title", "")
             low = titre.lower()
-            if not any(k in low for k in MOTS_OK) or any(k in low for k in MOTS_KO):
+            if not (4 < len(titre) < 150) or not any(k in low for k in MOTS_METIER) \
+                    or any(k in low for k in MOTS_KO):
                 continue
-            li = a.find_parent("li")
-            infos = [i for i in (li.stripped_strings if li else []) if i != titre]
-            ok, d = passe_zone(ville, lieu_annonce(infos))
-            if not ok:
+            lien = urljoin(url, a["href"])
+            jid = "site:" + lien
+            if jid in trouvees:
                 continue
-            age = age_en_jours(infos[-1]) if infos else 0
-            ligne2 = " | ".join(infos)
-            if d is not None:
-                ligne2 += f"\n📏 {d:.0f} km de {ville}"
-            lien = f"https://www.jobscout24.ch/en/job/{jid}/"
-            trouvees[jid] = (age, f"🆕 {titre}\n{ligne2}\n{lien}")
+            trouvees[jid] = (0, f"🆕 {titre}\n🌐 {nom}\n{lien}", nom)
+            compte(nom, annonces=1)
+
+
+source_jobscout()
+source_jooble()
+source_sites()
 
 # ----------------------------------------------------------------------------
 # 4) ENVOI
 # ----------------------------------------------------------------------------
 if rapport:
-    choisies = sorted((a, j, t) for j, (a, t) in trouvees.items() if a <= rapport)
+    choisies = sorted((a, j, t) for j, (a, t, _) in trouvees.items() if a <= rapport)
     envoyer(f"📅 Annonces des {rapport} derniers jours : {len(choisies)} trouvée(s)")
 else:
-    choisies = sorted((a, j, t) for j, (a, t) in trouvees.items()
+    choisies = sorted((a, j, t) for j, (a, t, _) in trouvees.items()
                       if j not in seen and a <= JOURS_NORMAL)
 
 if choisies:
@@ -420,8 +542,9 @@ elif forcer and not rapport:
     envoyer("🔎 Aucune nouvelle annonce pour le moment.")
 
 if forcer:
-    envoyer(f"✅ Passage terminé : {pages_ok}/{pages_total} pages lues, "
-            f"{len(choisies)} annonce(s) envoyée(s).")
+    detail = "\n".join(f"• {n} : {st[0]}/{st[1]} pages lues, {st[2]} annonce(s) retenue(s)"
+                       for n, st in stats.items())
+    envoyer(f"✅ Passage terminé : {len(choisies)} annonce(s) envoyée(s).\n{detail}")
 
 settings["dernier_passage"] = time.time()
 sauver(SETTINGS_FILE, settings)
