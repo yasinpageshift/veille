@@ -1,8 +1,8 @@
 import json, os, requests
 from bs4 import BeautifulSoup
 
-TOKEN = os.environ["TG_TOKEN"]
-CHAT_ID = os.environ["TG_CHAT_ID"]
+TOKEN = os.environ["TG_TOKEN"].strip()
+CHAT_ID = os.environ["TG_CHAT_ID"].strip()
 
 # À remplir plus tard avec tes vrais sites
 SOURCES = []
@@ -11,8 +11,10 @@ SEEN_FILE = "seen.json"
 seen = set(json.load(open(SEEN_FILE))) if os.path.exists(SEEN_FILE) else set()
 
 def notifier(msg):
-    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                  data={"chat_id": CHAT_ID, "text": msg})
+    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                      data={"chat_id": CHAT_ID, "text": msg}, timeout=20)
+    print("Telegram:", r.status_code, r.text)
+    r.raise_for_status()
 
 if os.environ.get("MANUAL") == "1":
     notifier("✅ Le bot fonctionne !")
